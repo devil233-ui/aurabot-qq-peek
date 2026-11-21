@@ -1,0 +1,14 @@
+{
+  "id": "qq-peek",
+  "name": "跨群看一眼·喊她说话",
+  "version": "0.2.0",
+  "description": "翻白名单群的聊天记录（只读，最多 1000 条，图片另给可下载的新链接）；主人私聊里还能喊她去指定群说一句话、查某条消息带了哪些段。",
+  "category": "chat",
+  "tags": ["qq", "群聊", "聊天记录", "图片链接", "rkey", "aurabot"],
+  "author": "devil233-ui",
+  "license": "MIT",
+  "api": 1,
+  "minPluginVersion": "1.2.0",
+  "requires": [],
+  "capabilities": []
+}
