@@ -22,14 +22,14 @@ Aurabot（DSH 的 QQ 插件 [`dsh-aurabot-qq`](https://github.com/aureth-labs/ds
 
 ## 安装
 
-模块走 aurabot 的用户模块目录，**目录名必须和模块 id 一致**（`api.use('qq-peek')` 这类消费方按名字取，不符就静默拿不到）：
+跟 `aurabot-mod-memory` / `aurabot-mod-mc-inject` 一样，**仓库直接检出在模块目录里**，不另找地方放代码——目录名必须和模块 id 一致（`api.use('qq-peek')` 这类消费方按名字取，不符就静默拿不到）：
 
 ```bash
-git clone https://github.com/devil233-ui/aurabot-qq-peek /tmp/aurabot-qq-peek
-cp -r /tmp/aurabot-qq-peek/index.mjs /root/.dsh/plugins-data/aurabot/modules/qq-peek/
+git clone git@github.com:devil233-ui/aurabot-qq-peek.git \
+  /root/.dsh/plugins-data/aurabot/modules/qq-peek
 ```
 
-放好即可用，宿主会在约 10 秒内热重载（日志 `[modules] 模块「qq-peek」文件改了，重新加载`），**不用重启宿主**。
+已经在跑的就是这份：`cd` 进去改、提交、`git pull` 都直接生效。宿主会在约 10 秒内热重载（日志 `[modules] 模块「qq-peek」文件改了，重新加载`），**不用重启宿主**。
 
 ### 白名单
 
