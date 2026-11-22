@@ -62,6 +62,10 @@ function withRkey(url, rkey) {
     : url + (url.includes('?') ? '&' : '?') + 'rkey=' + rkey
 }
 
+// 「这条是我说的话」——传给 hub 的留痕标记。hub 只有看到 proactive 才在目标群 chatlog 补一条 bot 记录；
+// 缺了它，模块发的消息在 chatlog 里零命中（回看历史时这段对话等于没发生过）。
+const SAY_LOGGED = { proactive: true, proactiveCause: 'qq_say_in_group' }
+
 function imageUrlOf(seg) {
   const d = seg?.data ?? {}
   const u = d.url || d.file_url
@@ -71,7 +75,7 @@ function imageUrlOf(seg) {
 export default {
   id: 'qq-peek',
   name: '跨群看一眼·喊她说话',
-  version: '0.3.0',
+  version: '0.3.1',
   api: 1,
   description: '翻白名单群的聊天记录（只读）；主人私聊里还能喊她去指定群说一句话；开关打开后后台回合也能发群',
   // 模块设置：面板「模块」页按这里的声明自动生成表单，值存进 config.ext['qq-peek']
@@ -83,7 +87,7 @@ export default {
       key: 'sayInBackground',
       label: '后台回合也能发群',
       type: 'switch',
-      hint: '默认关。打开后，定时任务、日记、子智能体这类没人在等的回合里也能用 qq_say_in_group 往白名单群说话；发送走插件通道，chatlog 会留记录。',
+      hint: '默认关。打开后，定时任务、日记、子智能体这类没人在等的回合里也能用 qq_say_in_group 往白名单群说话；发送走 hub 通道并声明 proactive，chatlog 会留一条 bot 记录。',
     },
   ],
   setup(api) {
@@ -216,17 +220,19 @@ export default {
           const sentQuote = segs.find((x) => x.type === 'reply')?.data?.id ?? ''
           try {
             if (needSegments) {
-              await api.onebot('send_group_msg', { group_id: Number(gid), message: segs })
+              // 走 hub 的段发送（不是 api.onebot 直发），并声明「这条是我说的话」：
+              // hub 只有看到 proactive 才会在目标群的 chatlog 里补一条 bot 记录（0.3.0 用 onebot 直发，整条留痕被绕过）。
+              await api.sendSegments(`group:${gid}`, segs, 'qq_say_in_group', SAY_LOGGED)
             } else {
               // 纯文字分支：把 ||| 换成换行，别让分隔符露到群里
-              await api.sendText(`group:${gid}`, body.replace(/\|\|\|/g, '\n'))
+              await api.sendText(`group:${gid}`, body.replace(/\|\|\|/g, '\n'), SAY_LOGGED)
             }
           } catch (e) {
             if (!needSegments) return { ok: false, message: '发失败：' + (e?.message ?? String(e)) }
             // 段被网关拒（引用 id 过期、at 不允许等）时退回纯文字，别整条发不出去
             api.log.warn(`带段发送失败，改发纯文字：${e?.message ?? e}`)
             try {
-              await api.sendText(`group:${gid}`, body.replace(/<at:\s*\d+\s*>/g, '').replace(/<reply:\s*\d+\s*>/g, ''))
+              await api.sendText(`group:${gid}`, body.replace(/<at:\s*\d+\s*>/g, '').replace(/<reply:\s*\d+\s*>/g, ''), SAY_LOGGED)
             } catch (e2) {
               return { ok: false, message: '发失败：' + (e2?.message ?? String(e2)) }
             }

@@ -1,10 +1,17 @@
 {
   "id": "qq-peek",
   "name": "跨群看一眼·喊她说话",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "翻白名单群的聊天记录（只读，最多 1000 条，图片另给可下载的新链接）；主人私聊里还能喊她去指定群说一句话、查某条消息带了哪些段；打开开关后，定时/后台回合也能发群。",
   "category": "chat",
-  "tags": ["qq", "群聊", "聊天记录", "图片链接", "rkey", "aurabot"],
+  "tags": [
+    "qq",
+    "群聊",
+    "聊天记录",
+    "图片链接",
+    "rkey",
+    "aurabot"
+  ],
   "author": "devil233-ui",
   "license": "MIT",
   "api": 1,
@@ -19,7 +26,7 @@
       "key": "sayInBackground",
       "type": "switch",
       "label": "后台回合也能发群",
-      "hint": "默认关。打开后，定时任务、日记、子智能体这类没人在等的回合里也能用 qq_say_in_group 往白名单群说话；发送走插件通道，chatlog 会留记录。"
+      "hint": "默认关。打开后，定时任务、日记、子智能体这类没人在等的回合里也能用 qq_say_in_group 往白名单群说话；发送走 hub 通道并声明 proactive，chatlog 会留一条 bot 记录。"
     }
   ]
 }
