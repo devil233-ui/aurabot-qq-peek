@@ -12,6 +12,10 @@ Aurabot 的用户模块「跨群看一眼」。上游插件是 `dsh-aurabot-qq`�
 - **目录名 = 模块 id**：部署目录必须是 `modules/qq-peek/`，入口 `index.mjs`；仓库就检在这个目录里（跟 `aurabot-mod-memory` 一样），别再另建副本，否则线上跑的和你改的不是同一份。改名会让 `api.use('qq-peek')` 拿到 null 并被 `?.` 静默跳过。
 - **改 `index.mjs` 约 10 秒热重载**，不重启宿主；改 `config.json`（白名单）才需要重启。
 - **消息 id 是跨工具的主键**：`qq_peek_group` 每行开头的 `[id]`、`qq_msg_info` 的入参、`qq_say_in_group` 的 `quote` 都是它。改输出格式别动这个前缀。
+- **模块设置声明写在模块导出里，不在 `module.json`**：面板「模块」页按 `export default { defaults, settings: [...] }` 渲染表单，值存进 `config.ext['qq-peek']`。`module.json` 里的 settings 不驱动面板（实测只改 module.json 时 `/aurabot/api/state` 仍报 `settings: []`、`version` 还是导出里那个）。settings 会随 `index.mjs` 热重载一起刷新。
+- **改 `config.json` 里的 ext 值要重启宿主才进内存**：面板保存走 `setConfig` 即时生效；直接改文件只落到磁盘，得等重启（2026-11-22 就是这样把 `sayInBackground` 打开的）。
+- **后台/定时回合原来拿不到本模块的工具**：这类会话是 `chat.kind === 'system'`，宿主把 `level` 落成 `social`（`src/chat/hub.js` 里 `chat.kind === 'system'` 那一支），工具选择器必须显式放行。`sayInBackground` 开关只放行 `qq_say_in_group`，`qq_peek_group` 在 system 会话里仍被挡（读历史会白吃上下文，要用再单独放）。
+- **`/aurabot/api` 管理接口会校验 Host**：服务监听 `10.8.0.10:3301`（不是 127.0.0.1），从本机 curl 要带 `-H 'Host: 127.0.0.1:3301'`，否则 403「只接受本机回环、localhost 或已配置的面板对外域名」；token 取 `/var/log/dsh-web.log` 末尾那条。
 
 ## 与上游的分工
 
