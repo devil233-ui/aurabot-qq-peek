@@ -71,9 +71,21 @@ function imageUrlOf(seg) {
 export default {
   id: 'qq-peek',
   name: '跨群看一眼·喊她说话',
-  version: '0.1.0',
+  version: '0.3.0',
   api: 1,
-  description: '翻白名单群的聊天记录（只读）；主人私聊里还能喊她去指定群说一句话',
+  description: '翻白名单群的聊天记录（只读）；主人私聊里还能喊她去指定群说一句话；开关打开后后台回合也能发群',
+  // 模块设置：面板「模块」页按这里的声明自动生成表单，值存进 config.ext['qq-peek']
+  defaults: {
+    sayInBackground: false,
+  },
+  settings: [
+    {
+      key: 'sayInBackground',
+      label: '后台回合也能发群',
+      type: 'switch',
+      hint: '默认关。打开后，定时任务、日记、子智能体这类没人在等的回合里也能用 qq_say_in_group 往白名单群说话；发送走插件通道，chatlog 会留记录。',
+    },
+  ],
   setup(api) {
     const allowed = () => new Set((api.config()?.allow?.groups ?? []).map(String))
     const hint = () => {
@@ -82,6 +94,10 @@ export default {
     }
 
     api.rule(() => `你能主动翻别人的群：qq_peek_group(群号, 条数)。现在能翻的群号是 ${hint()}。别人提到某个群的事、你想知道那边在聊什么时就用它，不用等人转述。`)
+    // 定时/后台回合（没人在等）里也能喊发群：开关打开时才把这条告诉她
+    api.rule(() => api.settings?.().sayInBackground === true
+      ? `定时任务、日记、子智能体这类后台回合里，你也可以主动去白名单群说话：qq_say_in_group(群, 内容)。那边没有人在等你，发完不必等回话，但要在最终输出里写清发到了哪个群、说了什么、message_id 是多少。`
+      : '')
     // 群名 → 群号的对照（启动时取自网关，取不到就留空）
     let names = new Map()
     api.onebot('get_group_list', {}).then((list) => {
@@ -151,9 +167,10 @@ export default {
       })
     })
 
-    // 主人私聊里：喊她去指定群说一句话（原样发出）
+    // 主人私聊里、或（开关打开时）定时/后台回合：喊她去指定群说一句话（原样发出）
     api.tool(({ chat, level }) => {
-      if (chat.kind !== 'private' || level !== 'full') return []
+      const fromBackground = chat.kind === 'system' && api.settings?.().sayInBackground === true
+      if (!fromBackground && (chat.kind !== 'private' || level !== 'full')) return []
       return api.defineTool({
         name: 'qq_say_in_group',
         description: '主人让你去某个群里说一句话时用。只能发到白名单群；群名或群号都行。',

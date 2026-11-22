@@ -7,8 +7,14 @@ Aurabot（DSH 的 QQ 插件 [`dsh-aurabot-qq`](https://github.com/aureth-labs/ds
 | 工具 | 谁能用 | 做什么 |
 |---|---|---|
 | `qq_peek_group(group_id, count, images)` | 白名单群的会话 | 翻某个群最近 `count` 条（默认 30，**最多 1000**），每行开头 `[消息id]`；图段就地标成 `[图片#n]`，末尾统一给可下载的链接 |
-| `qq_say_in_group(group, text, quote)` | 主人私聊（`level=full`） | 让她去白名单群说一句话，内容原样发出；`<at:QQ号>`、`<reply:消息id>` 会被还原成真动作 |
+| `qq_say_in_group(group, text, quote)` | 主人私聊（`level=full`）；模块设置里打开「后台回合也能发群」后，定时/后台回合也可用 | 让她去白名单群说一句话，内容原样发出；`<at:QQ号>`、`<reply:消息id>` 会被还原成真动作。走插件通道，chatlog 会留一行 `who: bot` |
 | `qq_msg_info(message_id)` | 任意会话 | 查一条消息实际带了哪些段（引用 / @ / 图），发完带引用的消息拿它自查 |
+
+## 为什么要「后台回合也能发群」
+
+定时任务、日记、子智能体这些回合**没有人在等回复**，宿主给它们的会话是 `system` 档（`level` 落到 `social`，见 `src/chat/hub.js` 里 `chat.kind === 'system'` 那一支）。`qq_say_in_group` 原本只在「主人私聊 + `level=full`」挂载，于是这类回合里她只能绕过插件、直接打网关的 HTTP 端口发消息：话发出去了，插件不知情，`chatlog` 里自然没有副本——这就是「定时任务丢档」的根因。
+
+打开这个开关后，`system` 回合也会挂上 `qq_say_in_group`，但她仍然**只能发 `allow.groups` 白名单里的群**，而且发送走 `api.onebot`（过插件），`chatlog` 会记一行 `who: bot`。默认关，因为它等于把「主动发群」的能力交给所有后台回合。
 
 ## 图片链接为什么要自己续 rkey
 
