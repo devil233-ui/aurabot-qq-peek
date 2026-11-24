@@ -1,5 +1,8 @@
 /** @type {import('../aurabot').AurabotModule} */
 // 让她能主动翻「别的群」的聊天记录（内置 qq_chat_history 只能翻当前聊天）
+import { randomUUID } from 'node:crypto'
+import { readFileSync, renameSync, writeFileSync } from 'node:fs'
+
 const LABEL = { image: '[图片]', face: '[表情]', mface: '[表情]', record: '[语音]', video: '[视频]', file: '[文件]', forward: '[合并转发]' }
 
 function segText(seg, self) {
@@ -66,6 +69,48 @@ function withRkey(url, rkey) {
 // 缺了它，模块发的消息在 chatlog 里零命中（回看历史时这段对话等于没发生过）。
 const SAY_LOGGED = { proactive: true, proactiveCause: 'qq_say_in_group' }
 
+// ---- 忙时排队（后台回合发群用）----
+// 后台回合没人在等，硬插进一个正热闹的群只会打断对话，所以先排着，等那个群安静再补发。
+// 口径照 dsh-plugin-autonomy 的 outbox：等她接话 / 她刚说过话都算忙，超时作废（晚发比乱发更糟）。
+const OUTBOX_MAX = 20
+const OUTBOX_ATTEMPTS = 3
+const WAITING_MS = 10 * 60_000   // 只有最近这么久的入站才算「有人在等她接话」，更早的不堵
+const COOLDOWN_MS = 3 * 60_000   // 她刚在同一群说过话，这么久内算「她还在那个群说话」
+
+function loadOutbox(file, log) {
+  try {
+    const parsed = JSON.parse(readFileSync(file, 'utf8'))
+    if (!Array.isArray(parsed)) return []
+    const items = parsed
+      .filter((x) => x && x.id && x.gid && typeof x.body === 'string')
+      // 上次扫描到一半进程没了：sending 的退回去重新排，别让它永远挂着
+      .map((x) => (x.status === 'sending' ? { ...x, status: 'pending' } : x))
+    return trimOutbox(items)
+  } catch (e) {
+    if (e?.code !== 'ENOENT') log?.warn?.(`排队文件读不出来，已忽略旧内容：${e?.message ?? e}`)
+    return []
+  }
+}
+
+function saveOutbox(file, items, log) {
+  try {
+    const tmp = `${file}.${process.pid}.tmp`
+    writeFileSync(tmp, JSON.stringify(items), { encoding: 'utf8', mode: 0o600 })
+    renameSync(tmp, file)
+  } catch (e) {
+    log?.warn?.(`排队文件写不进去：${e?.message ?? e}`)
+  }
+}
+
+/** 只丢已结案的旧条目；待发的一条都不丢。 */
+function trimOutbox(items, max = OUTBOX_MAX) {
+  if (items.length <= max) return [...items]
+  const pending = items.filter((x) => x.status === 'pending' || x.status === 'sending')
+  const done = items.filter((x) => x.status !== 'pending' && x.status !== 'sending')
+  const keepDone = Math.max(0, max - pending.length)
+  return [...(keepDone ? done.slice(-keepDone) : []), ...pending]
+}
+
 function imageUrlOf(seg) {
   const d = seg?.data ?? {}
   const u = d.url || d.file_url
@@ -75,12 +120,14 @@ function imageUrlOf(seg) {
 export default {
   id: 'qq-peek',
   name: '跨群看一眼·喊她说话',
-  version: '0.3.1',
+  version: '0.4.0',
   api: 1,
-  description: '翻白名单群的聊天记录（只读）；主人私聊里还能喊她去指定群说一句话；开关打开后后台回合也能发群',
+  description: '翻白名单群的聊天记录（只读）；主人私聊里还能喊她去指定群说一句话；开关打开后后台回合也能发群，遇到群里正热闹就排队等安静再发',
   // 模块设置：面板「模块」页按这里的声明自动生成表单，值存进 config.ext['qq-peek']
   defaults: {
     sayInBackground: false,
+    queueWhenBusy: true,
+    queueTtlMinutes: 10,
   },
   settings: [
     {
@@ -88,6 +135,21 @@ export default {
       label: '后台回合也能发群',
       type: 'switch',
       hint: '默认关。打开后，定时任务、日记、子智能体这类没人在等的回合里也能用 qq_say_in_group 往白名单群说话；发送走 hub 通道并声明 proactive，chatlog 会留一条 bot 记录。',
+    },
+    {
+      key: 'queueWhenBusy',
+      label: '群里正热闹时先排队',
+      type: 'switch',
+      hint: '默认开。后台回合要发的那个群如果正有人说话还没接上、或者她刚在那儿说过话，就先排着不等插话，等群安静了再补发；主人在私聊里直接喊她发的那句不受影响，照旧立刻发。',
+    },
+    {
+      key: 'queueTtlMinutes',
+      label: '排队最多等多久（分钟）',
+      type: 'number',
+      min: 0,
+      max: 240,
+      step: 1,
+      hint: '默认 10 分钟，对齐 dsh-plugin-autonomy 的待发队列。等到这个时间群还没安静，那条话就作废不发；填 0 等于关掉排队，忙也照发。',
     },
   ],
   setup(api) {
@@ -109,9 +171,163 @@ export default {
     }).catch(() => {})
     const nameOf = (gid) => names.get(String(gid)) ?? ''
     const label = (gid) => nameOf(gid) ? `${nameOf(gid)}(${gid})` : String(gid)
+
+    // ---- 忙时排队：后台回合发群，遇到那个群正热闹就先排着 ----
+    const outboxFile = api.dataDir('outbox.json')
+    let outbox = loadOutbox(outboxFile, api.log)
+    // 她刚发完、网关还没回显的那一段靠自己记：判据以群历史为准，这里只补「最近一次出站」。
+    const lastOut = new Map()
+    api.on('activity', (e) => {
+      const chatId = String(e?.chatId ?? '')
+      if (!chatId.startsWith('group:') || e?.kind !== 'out') return
+      lastOut.set(chatId.slice('group:'.length), Date.now())
+    })
+
+    const queueTtlMinutes = () => Math.max(0, Math.min(240, Number(api.settings?.().queueTtlMinutes ?? 10) || 0))
+
+    /** 这个群现在是不是「正热闹」：有人说了话还没接上，或她刚在这儿说过话。 */
+    const groupBusy = async (gid) => {
+      const now = Date.now()
+      let inAt = 0
+      let histOut = 0
+      // 判据以群历史为准：热重载、重启都不影响，也不用维护一份自己的影子状态。
+      try {
+        const r = await api.onebot('get_group_msg_history', { group_id: Number(gid), count: 20 })
+        const self = String(api.config()?.botQQ ?? '')
+        for (const m of (r?.messages || [])) {
+          const at = m.time ? m.time * 1000 : 0
+          if (!at) continue
+          if (String(m.user_id ?? m.sender?.user_id) === self) histOut = Math.max(histOut, at)
+          else inAt = Math.max(inAt, at)
+        }
+      } catch (e) {
+        api.log.debug?.(`排队前查 ${gid} 的群历史失败，按不忙处理：${e?.message ?? e}`)
+      }
+      const outAt = Math.max(histOut, lastOut.get(gid) ?? 0)
+      if (inAt > outAt && now - inAt <= WAITING_MS) return { busy: true, why: '那边有人说了话，还没接上' }
+      if (outAt && now - outAt < COOLDOWN_MS) return { busy: true, why: '她刚在那个群说过话' }
+      return { busy: false }
+    }
+
+    // <at:QQ号> / <reply:消息id> 还原成真段；写死的 ||| 当换行
+    const parseSay = (body, quote) => {
+      const segs = []
+      const quoteId = String(quote ?? '').trim()
+      if (quoteId) segs.push({ type: 'reply', data: { id: quoteId } })
+      const re = /<at:\s*(\d+)\s*>|<reply:\s*(\d+)\s*>/g
+      let last = 0
+      let m
+      while ((m = re.exec(body)) !== null) {
+        const before = body.slice(last, m.index)
+        if (before.trim()) segs.push({ type: 'text', data: { text: before.replace(/\|\|\|/g, '\n') } })
+        if (m[1] !== undefined) segs.push({ type: 'at', data: { qq: m[1] } })
+        else if (m[2] !== undefined && !segs.some((x) => x.type === 'reply')) segs.push({ type: 'reply', data: { id: m[2] } })
+        last = re.lastIndex
+      }
+      const tail = body.slice(last)
+      if (tail.trim() || segs.length === 0) segs.push({ type: 'text', data: { text: tail.replace(/\|\|\|/g, '\n') || body } })
+      return segs
+    }
+
+    /** 直接发和排队补发共用一条路：发完自己记一笔「她刚说过话」。 */
+    const sendSay = async (gid, body, quote) => {
+      const segs = parseSay(body, quote)
+      const needSegments = segs.some((x) => x.type !== 'text')
+      const sentQuote = segs.find((x) => x.type === 'reply')?.data?.id ?? ''
+      const hasAt = segs.some((x) => x.type === 'at')
+      let r
+      try {
+        // 走 hub 的发送（不是 api.onebot 直发），并声明「这条是我说的话」：
+        // hub 只有看到 proactive 才会在目标群的 chatlog 里补一条 bot 记录。
+        r = needSegments
+          ? await api.sendSegments(`group:${gid}`, segs, 'qq_say_in_group', SAY_LOGGED)
+          : await api.sendText(`group:${gid}`, body.replace(/\|\|\|/g, '\n'), SAY_LOGGED)
+      } catch (e) {
+        if (!needSegments) return { ok: false, message: e?.message ?? String(e) }
+        // 段被网关拒（引用 id 过期、at 不允许等）时退回纯文字，别整条发不出去
+        api.log.warn(`带段发送失败，改发纯文字：${e?.message ?? e}`)
+        try {
+          r = await api.sendText(`group:${gid}`, body.replace(/<at:\s*\d+\s*>/g, '').replace(/<reply:\s*\d+\s*>/g, ''), SAY_LOGGED)
+        } catch (e2) {
+          return { ok: false, message: e2?.message ?? String(e2) }
+        }
+      }
+      // 出站策略拦下时快捷发送返回 null——那不是发出去了
+      if (r === null || r === undefined) return { ok: false, message: '被出站策略拦下了' }
+      lastOut.set(gid, Date.now())
+      return { ok: true, mid: String(r?.message_id ?? ''), sentQuote, hasAt }
+    }
+
+    const enqueueSay = (gid, body, quote, ttlMin) => {
+      const now = Date.now()
+      const item = {
+        id: randomUUID().replace(/-/g, '').slice(0, 12),
+        gid,
+        body: String(body).slice(0, 2000),
+        quote: String(quote ?? '').trim(),
+        createdAt: now,
+        expiresAt: now + ttlMin * 60_000,
+        status: 'pending',
+        attempts: 0,
+      }
+      outbox = trimOutbox([...outbox, item])
+      saveOutbox(outboxFile, outbox, api.log)
+      return item
+    }
+
+    /** 定时扫描：群安静了就补发，等到过期就作废。与 autonomy 的 outbox 同口径。 */
+    let draining = false
+    const drainOutbox = async () => {
+      if (draining || !outbox.some((x) => x.status === 'pending')) return
+      draining = true
+      try {
+        for (const item of outbox) {
+          if (item.status !== 'pending') continue
+          if (Date.now() >= item.expiresAt) {
+            item.status = 'expired'
+            item.note = '等到过期，那个群也没安静下来'
+            saveOutbox(outboxFile, outbox, api.log)
+            api.log.info(`排队的话过期作废（群 ${item.gid}）：${item.body.slice(0, 40)}`)
+            continue
+          }
+          const b = await groupBusy(item.gid)
+          if (b.busy) continue
+          item.status = 'sending'
+          saveOutbox(outboxFile, outbox, api.log)
+          const sent = await sendSay(item.gid, item.body, item.quote)
+          if (sent.ok) {
+            item.status = 'sent'
+            item.note = '群安静后补发'
+            api.log.info(`排队的话已补发到 ${label(item.gid)}${sent.sentQuote ? '（引用 ' + sent.sentQuote + '）' : ''}：${item.body.slice(0, 40)}`)
+          } else {
+            item.attempts = (item.attempts ?? 0) + 1
+            if (item.attempts >= OUTBOX_ATTEMPTS) {
+              item.status = 'failed'
+              item.note = `补发 ${item.attempts} 次都没成功：${sent.message ?? ''}`
+              api.log.warn(`排队的话补发失败，已放弃（群 ${item.gid}）：${sent.message ?? ''}`)
+            } else {
+              item.status = 'pending'
+              item.note = `第 ${item.attempts} 次补发失败，下次再试`
+            }
+          }
+          saveOutbox(outboxFile, outbox, api.log)
+        }
+        const before = outbox.length
+        outbox = trimOutbox(outbox)
+        if (outbox.length !== before) saveOutbox(outboxFile, outbox, api.log)
+      } finally {
+        draining = false
+      }
+    }
+    api.every(20_000, drainOutbox, '发群排队补发')
+
     api.rule(() => {
       const idx = [...allowed()].map((g) => label(g)).join('、')
-      return `主人能在私聊里喊你去某个群说话：qq_say_in_group(群, 内容)。可发的群：${idx}（群名取自网关的群列表，写群名或群号都行）。主人让你去某个群说句话时，就用它把话原样发过去，然后回主人一句发了。内容里可以写 <at:QQ号> 真 @ 人、写 <reply:消息id> 引用某条，这两个标签会被还原成真动作（不会显示成字符）。主人说「引着某条说」「接着那条说」时，把那条的 message_id 填进 qq_say_in_group 的引用参数（不知道 id 就先 qq_peek_group 看一眼，每行开头 [] 里就是）。判断引用有没有真挂上：你自己翻聊天记录只会看到纯文字（你那边没有段层），要确认就用 qq_msg_info(消息id) 查一下——它会告诉你这条消息带没带 reply 段，发完带引用的消息先自查一遍再回话。`
+      const ttl = queueTtlMinutes()
+      const queueNote = api.settings?.().queueWhenBusy !== false && ttl > 0
+        ? `另外：后台回合（定时任务、日记、子智能体这类没人在等的回合）发群时，如果那个群正有人说话还没接上、或者你刚在那儿说过话，模块会先替你排上队，等群安静了自动补发，最多等 ${ttl} 分钟，过期作废——工具结果会告诉你排没排上，别当成已经发出去了。`
+        : ''
+      return `主人能在私聊里喊你去某个群说话：qq_say_in_group(群, 内容)。可发的群：${idx}（群名取自网关的群列表，写群名或群号都行）。主人让你去某个群说句话时，就用它把话原样发过去，然后回主人一句发了。内容里可以写 <at:QQ号> 真 @ 人、写 <reply:消息id> 引用某条，这两个标签会被还原成真动作（不会显示成字符）。主人说「引着某条说」「接着那条说」时，把那条的 message_id 填进 qq_say_in_group 的引用参数（不知道 id 就先 qq_peek_group 看一眼，每行开头 [] 里就是）。判断引用有没有真挂上：你自己翻聊天记录只会看到纯文字（你那边没有段层），要确认就用 qq_msg_info(消息id) 查一下——它会告诉你这条消息带没带 reply 段，发完带引用的消息先自查一遍再回话。${queueNote}`
     })
 
     api.tool(({ chat }) => {
@@ -200,44 +416,21 @@ export default {
             const idx = [...allowed()].map((g) => label(g)).join('、')
             return { ok: false, message: `没认出是哪个群（能发的：${idx}）` }
           }
-          const quoteId = String(quote ?? '').trim()
-          // 把 <at:QQ号> / <reply:消息id> 还原成真正的段；||| 按换行处理（这里原样发，不拆多条）
-          const segs = []
-          if (quoteId) segs.push({ type: 'reply', data: { id: quoteId } })
-          const re = /<at:\s*(\d+)\s*>|<reply:\s*(\d+)\s*>/g
-          let last = 0
-          let m
-          while ((m = re.exec(body)) !== null) {
-            const before = body.slice(last, m.index)
-            if (before.trim()) segs.push({ type: 'text', data: { text: before.replace(/\|\|\|/g, '\n') } })
-            if (m[1] !== undefined) segs.push({ type: 'at', data: { qq: m[1] } })
-            else if (m[2] !== undefined && !segs.some((x) => x.type === 'reply')) segs.push({ type: 'reply', data: { id: m[2] } })
-            last = re.lastIndex
-          }
-          const tail = body.slice(last)
-          if (tail.trim() || segs.length === 0) segs.push({ type: 'text', data: { text: tail.replace(/\|\|\|/g, '\n') || body } })
-          const needSegments = segs.some((x) => x.type !== 'text')
-          const sentQuote = segs.find((x) => x.type === 'reply')?.data?.id ?? ''
-          try {
-            if (needSegments) {
-              // 走 hub 的段发送（不是 api.onebot 直发），并声明「这条是我说的话」：
-              // hub 只有看到 proactive 才会在目标群的 chatlog 里补一条 bot 记录（0.3.0 用 onebot 直发，整条留痕被绕过）。
-              await api.sendSegments(`group:${gid}`, segs, 'qq_say_in_group', SAY_LOGGED)
-            } else {
-              // 纯文字分支：把 ||| 换成换行，别让分隔符露到群里
-              await api.sendText(`group:${gid}`, body.replace(/\|\|\|/g, '\n'), SAY_LOGGED)
-            }
-          } catch (e) {
-            if (!needSegments) return { ok: false, message: '发失败：' + (e?.message ?? String(e)) }
-            // 段被网关拒（引用 id 过期、at 不允许等）时退回纯文字，别整条发不出去
-            api.log.warn(`带段发送失败，改发纯文字：${e?.message ?? e}`)
-            try {
-              await api.sendText(`group:${gid}`, body.replace(/<at:\s*\d+\s*>/g, '').replace(/<reply:\s*\d+\s*>/g, ''), SAY_LOGGED)
-            } catch (e2) {
-              return { ok: false, message: '发失败：' + (e2?.message ?? String(e2)) }
+          // 后台回合：那个群正热闹就先排着，别插话。主人在私聊里直接喊她发的那句不排队（他正等着结果）。
+          if (chat.kind === 'system' && api.settings?.().queueWhenBusy !== false) {
+            const ttlMin = queueTtlMinutes()
+            if (ttlMin > 0) {
+              const b = await groupBusy(gid)
+              if (b.busy) {
+                enqueueSay(gid, body, quote, ttlMin)
+                api.log.info(`qq_say_in_group 排队：${label(gid)} 正忙（${b.why}），最多等 ${ttlMin} 分钟`)
+                return { ok: true, message: `那个群现在正热闹（${b.why}），已经排上队，安静下来会自动发，最多等 ${ttlMin} 分钟；过期就不发了。` }
+              }
             }
           }
-          api.log.info(`qq_say_in_group 已发到 ${label(gid)}${sentQuote ? '（引用 ' + sentQuote + '）' : ''}${segs.some((x) => x.type === 'at') ? '（带 @）' : ''}：${body.slice(0, 40)}`)
+          const sent = await sendSay(gid, body, quote)
+          if (!sent.ok) return { ok: false, message: '发失败：' + (sent.message ?? '') }
+          api.log.info(`qq_say_in_group 已发到 ${label(gid)}${sent.sentQuote ? '（引用 ' + sent.sentQuote + '）' : ''}${sent.hasAt ? '（带 @）' : ''}：${body.slice(0, 40)}`)
           return { ok: true, message: `已发到 ${label(gid)}` }
         },
       })

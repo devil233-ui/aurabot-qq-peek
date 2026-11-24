@@ -13,6 +13,7 @@ Aurabot 的用户模块「跨群看一眼」。上游插件是 `dsh-aurabot-qq`�
 - **改 `index.mjs` 约 10 秒热重载**，不重启宿主；改 `config.json`（白名单）才需要重启。
 - **发言必须显式声明留痕标记**：hub 的 `sendText` / `sendSegments` 只有收到 `{ proactive: true, proactiveCause }` 才会在目标群 `chatlog` 补一条 `who: bot`；模块快捷 API 默认不传这个标记。段发送一律走 `api.sendSegments(chatId, segs, note, opts)`，不要用 `api.onebot('send_group_msg')` 直发——那样整条留痕被绕过（0.3.0 的丢档就是这么来的，2026-11-22 修）。
 - **消息 id 是跨工具的主键**：`qq_peek_group` 每行开头的 `[id]`、`qq_msg_info` 的入参、`qq_say_in_group` 的 `quote` 都是它。改输出格式别动这个前缀。
+- **后台回合发群会排队，判据现查历史**：`queueWhenBusy`（默认开）时，`system` 回合发群先查 `get_group_msg_history`——最近一条入站比她最近一条出站新、或她 3 分钟内刚在这个群说过话，就算「正热闹」，入队等安静；队列在 `api.dataDir('outbox.json')`，`api.every(20_000)` 扫描，TTL 默认 10 分钟，补发失败 3 次放弃，`sending` 状态重读时复位 `pending`。补发也必须带 `{ proactive: true }`，否则又回到丢档。主人私聊里的命令不排队（`chat.kind !== 'system'`）。改这块先跑 `node --test test/*.test.mjs`（12 个回归用例在 `test/queue-when-busy.test.mjs`）。
 - **模块设置声明写在模块导出里，不在 `module.json`**：面板「模块」页按 `export default { defaults, settings: [...] }` 渲染表单，值存进 `config.ext['qq-peek']`。`module.json` 里的 settings 不驱动面板（实测只改 module.json 时 `/aurabot/api/state` 仍报 `settings: []`、`version` 还是导出里那个）。settings 会随 `index.mjs` 热重载一起刷新。
 - **改 `config.json` 里的 ext 值要重启宿主才进内存**：面板保存走 `setConfig` 即时生效；直接改文件只落到磁盘，得等重启（2026-11-22 就是这样把 `sayInBackground` 打开的）。
 - **后台/定时回合原来拿不到本模块的工具**：这类会话是 `chat.kind === 'system'`，宿主把 `level` 落成 `social`（`src/chat/hub.js` 里 `chat.kind === 'system'` 那一支），工具选择器必须显式放行。`sayInBackground` 开关只放行 `qq_say_in_group`，`qq_peek_group` 在 system 会话里仍被挡（读历史会白吃上下文，要用再单独放）。
